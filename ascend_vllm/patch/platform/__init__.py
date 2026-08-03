@@ -24,6 +24,12 @@ from ascend_vllm.patch.platform import patch_detokenizer as patch_detokenizer
 from ascend_vllm.patch.platform import patch_api_server as patch_api_server
 from ascend_vllm.patch.platform import patch_image as patch_image
 from ascend_vllm.patch.platform import (
+    patch_eagle_mm_encoder_cache as patch_eagle_mm_encoder_cache,
+)
+from ascend_vllm.patch.platform import (
+    patch_qwen3vl_multivideo as patch_qwen3vl_multivideo,
+)
+from ascend_vllm.patch.platform import (
     patch_disable_completion_tokens_details as patch_disable_completion_tokens_details,
 )
 from ascend_vllm.patch.platform import (
