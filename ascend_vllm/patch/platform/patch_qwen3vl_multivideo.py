@@ -14,8 +14,9 @@ It backports the Qwen3VL changes from upstream commits:
 * ``dd944845777b``: for Transformers >= 5.10 processors, replace only the
   bare ``<|video_pad|>`` token rather than the whole visual triplet.
 
-With Transformers 5.14.1, replacing only the bare video token preserves the
-existing ``<|vision_end|><|vision_start|>`` tokens between adjacent videos.
+When the active Qwen3VL processor expands only the bare video token, replacing
+only that token preserves the existing ``<|vision_end|><|vision_start|>``
+tokens between adjacent videos.
 For the reproduced request this changes v0.23.0 feature ranges from:
 
     video1 [3, 11662), video2 [11662, 23321)
@@ -116,7 +117,7 @@ def _get_video_placeholder_ranges(
 
 
 def _expands_only_video_token(hf_processor: ProcessorMixin) -> bool:
-    """Detect Transformers >= 5.10 Qwen3VL bare-video-token expansion."""
+    """Detect Qwen3VL processor bare-video-token expansion behavior."""
     mixin_impl = getattr(ProcessorMixin, "replace_video_token", None)
     processor_impl = getattr(type(hf_processor), "replace_video_token", None)
     return processor_impl is not None and processor_impl is not mixin_impl
@@ -313,8 +314,19 @@ def _get_prompt_updates(
 
     if _expands_only_video_token(hf_processor):
         video_target = hf_processor.video_token
+        video_target_mode = "bare_video_token"
     else:
         video_target = "<|vision_start|><|video_pad|><|vision_end|>"
+        video_target_mode = "visual_triplet"
+
+    _trace(
+        "prompt_updates",
+        process_id=os.getpid(),
+        processor_class=f"{type(hf_processor).__module__}.{type(hf_processor).__qualname__}",
+        video_count=mm_items.get_all_counts().get("video", 0),
+        video_target=video_target,
+        video_target_mode=video_target_mode,
+    )
 
     return [
         qwen3_vl_module.PromptReplacement(
@@ -345,7 +357,14 @@ def apply_patch() -> None:
     processor_cls._get_prompt_updates = _get_prompt_updates
     processor_cls._ascend_vllm_qwen3vl_multivideo_patch = True
     logger.info("Applied Qwen3VL multi-video placeholder backport for vLLM v0.23.0")
-    _trace("patch_applied", trace_env=_TRACE_ENV)
+    _trace(
+        "patch_applied",
+        process_id=os.getpid(),
+        processor_class=f"{processor_cls.__module__}.{processor_cls.__qualname__}",
+        call_hf_processor_module=processor_cls._call_hf_processor.__module__,
+        prompt_updates_module=processor_cls._get_prompt_updates.__module__,
+        trace_env=_TRACE_ENV,
+    )
     _PATCH_APPLIED = True
 
 

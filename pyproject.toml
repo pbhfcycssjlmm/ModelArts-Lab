@@ -9,6 +9,7 @@ extend-exclude = [
     ".venv",
     "build",
     "dist",
+    "handoff/qwen3vl-mtp-v0.23.0/replacement",
 ]
 
 [tool.ruff.lint]
