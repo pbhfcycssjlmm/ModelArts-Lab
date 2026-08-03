@@ -32,6 +32,7 @@ correct visual boundary tokens between adjacent videos.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import torch
@@ -40,14 +41,96 @@ from vllm.multimodal.utils import get_mm_features_in_window
 
 logger = init_logger(__name__)
 _PATCH_APPLIED = False
+_TRACE_ENV = "VLLM_TRACE_MM_SCHEDULER"
+
+
+def _trace(event: str, **fields: object) -> None:
+    if os.getenv(_TRACE_ENV, "0").lower() not in {"1", "true", "yes", "on"}:
+        return
+
+    details = " ".join(f"{key}={value!r}" for key, value in fields.items())
+    logger.warning("MM_PATCH_TRACE component=eagle_encoder_cache event=%s %s", event, details)
 
 
 def _patch_scheduler() -> None:
     from vllm.v1.core.sched.scheduler import Scheduler
 
-    original = Scheduler._free_encoder_inputs
-    if getattr(original, "_ascend_vllm_eagle_encoder_cache_patch", False):
+    original_free = Scheduler._free_encoder_inputs
+    if getattr(original_free, "_ascend_vllm_eagle_encoder_cache_patch", False):
         return
+
+    original_schedule = Scheduler._try_schedule_encoder_inputs
+
+    def trace_encoder_scheduling(
+        self: Scheduler,
+        request: Any,
+        num_computed_tokens: int,
+        num_new_tokens: int,
+        encoder_compute_budget: int,
+        shift_computed_tokens: int = 0,
+    ) -> Any:
+        result = original_schedule(
+            self,
+            request,
+            num_computed_tokens,
+            num_new_tokens,
+            encoder_compute_budget,
+            shift_computed_tokens,
+        )
+        if not request.has_encoder_inputs:
+            return result
+
+        scheduled_input_ids, scheduled_tokens, budget_after, external_input_ids = result
+        window_end = num_computed_tokens + num_new_tokens + shift_computed_tokens
+        lo, hi = get_mm_features_in_window(
+            request.mm_features,
+            start=num_computed_tokens,
+            end=window_end,
+        )
+        candidates = [
+            {
+                "input_id": input_id,
+                "range": (
+                    request.mm_features[input_id].mm_position.offset,
+                    request.mm_features[input_id].mm_position.offset + request.mm_features[input_id].mm_position.length,
+                ),
+                "encoder_embeds": request.mm_features[input_id].mm_position.get_num_embeds(),
+            }
+            for input_id in range(lo, hi)
+        ]
+        if lo < hi or scheduled_tokens == 0:
+            _trace(
+                "encoder_schedule_result",
+                request_id=request.request_id,
+                computed_tokens=num_computed_tokens,
+                requested_new_tokens=num_new_tokens,
+                shift_computed_tokens=shift_computed_tokens,
+                target_window=(
+                    num_computed_tokens,
+                    num_computed_tokens + num_new_tokens,
+                ),
+                feature_window=(lo, hi),
+                candidates=candidates,
+                cached_input_ids=sorted(self.encoder_cache_manager.get_cached_input_ids(request)),
+                encoder_budget_before=encoder_compute_budget,
+                encoder_budget_after=budget_after,
+                selected_input_ids=scheduled_input_ids,
+                external_input_ids=external_input_ids,
+                scheduled_tokens=scheduled_tokens,
+                cache_free=self.encoder_cache_manager.num_free_slots,
+                cache_freeable=self.encoder_cache_manager.num_freeable_slots,
+            )
+        if scheduled_tokens == 0:
+            _trace(
+                "encoder_schedule_zero_tokens",
+                request_id=request.request_id,
+                computed_tokens=num_computed_tokens,
+                shift_computed_tokens=shift_computed_tokens,
+                next_feature_start=(request.mm_features[lo].mm_position.offset if lo < hi else None),
+                cache_free=self.encoder_cache_manager.num_free_slots,
+                cache_freeable=self.encoder_cache_manager.num_freeable_slots,
+            )
+        return result
 
     def free_encoder_inputs_with_eagle_lookahead(self: Scheduler, request: Any) -> None:
         cached_input_ids = self.encoder_cache_manager.get_cached_input_ids(request)
@@ -63,15 +146,43 @@ def _patch_scheduler() -> None:
             mm_feature = request.mm_features[input_id]
             start_pos = mm_feature.mm_position.offset
             num_tokens = mm_feature.mm_position.length
-            if (
+            release_ready = (
                 self.is_encoder_decoder
                 and request.num_computed_tokens > 0
                 or start_pos + num_tokens + spec_lookahead <= confirmed_tokens
-            ):
+            )
+            _trace(
+                "encoder_cache_release_check",
+                request_id=request.request_id,
+                input_id=input_id,
+                placeholder_range=(start_pos, start_pos + num_tokens),
+                computed_tokens=request.num_computed_tokens,
+                num_output_placeholders=getattr(request, "num_output_placeholders", 0),
+                confirmed_tokens=confirmed_tokens,
+                spec_lookahead=spec_lookahead,
+                release_ready=release_ready,
+                cache_free=self.encoder_cache_manager.num_free_slots,
+                cache_freeable=self.encoder_cache_manager.num_freeable_slots,
+            )
+            if release_ready:
+                cache_free_before = self.encoder_cache_manager.num_free_slots
+                cache_freeable_before = self.encoder_cache_manager.num_freeable_slots
                 self.encoder_cache_manager.free_encoder_input(request, input_id)
+                _trace(
+                    "encoder_cache_reference_released",
+                    request_id=request.request_id,
+                    input_id=input_id,
+                    placeholder_range=(start_pos, start_pos + num_tokens),
+                    cache_free_before=cache_free_before,
+                    cache_freeable_before=cache_freeable_before,
+                    cache_free_after=self.encoder_cache_manager.num_free_slots,
+                    cache_freeable_after=self.encoder_cache_manager.num_freeable_slots,
+                )
 
     free_encoder_inputs_with_eagle_lookahead._ascend_vllm_eagle_encoder_cache_patch = True
+    trace_encoder_scheduling._ascend_vllm_eagle_encoder_cache_patch = True
     Scheduler._free_encoder_inputs = free_encoder_inputs_with_eagle_lookahead
+    Scheduler._try_schedule_encoder_inputs = trace_encoder_scheduling
 
 
 def _patch_gpu_model_runner() -> None:
@@ -107,6 +218,18 @@ def _patch_gpu_model_runner() -> None:
                 start=num_computed_tokens,
                 end=num_computed_tokens + num_scheduled_tokens,
             )
+            _trace(
+                "gpu_runner_mm_window",
+                request_id=req_id,
+                runner_class=type(self).__name__,
+                runner_module=type(self).__module__,
+                pcp_size=getattr(self, "pcp_size", None),
+                computed_tokens=req_state.num_computed_tokens,
+                shift_computed_tokens=shift_computed_tokens,
+                target_end=target_end,
+                gather_window=(num_computed_tokens, num_computed_tokens + num_scheduled_tokens),
+                feature_window=(lo, hi),
+            )
             for input_id in range(lo, hi):
                 mm_feature = mm_features[input_id]
                 pos_info = mm_feature.mm_position
@@ -124,12 +247,35 @@ def _patch_gpu_model_runner() -> None:
                     continue
 
                 encoder_output = self.encoder_cache.get(mm_feature.identifier)
+                _trace(
+                    "gpu_runner_encoder_feature",
+                    request_id=req_id,
+                    input_id=input_id,
+                    placeholder_range=(start_pos, start_pos + num_encoder_tokens),
+                    target_end=target_end,
+                    cache_hit=encoder_output is not None,
+                    embed_range=(curr_embeds_start, curr_embeds_end),
+                )
                 if encoder_output is None:
                     # Only the EAGLE +1 look-ahead can see a feature that
                     # starts beyond the target range. It is intentionally not
                     # consumed by the target model in this iteration.
                     if shift_computed_tokens and start_pos >= target_end:
+                        _trace(
+                            "gpu_runner_drafter_only_cache_miss",
+                            request_id=req_id,
+                            input_id=input_id,
+                            placeholder_start=start_pos,
+                            target_end=target_end,
+                        )
                         continue
+                    _trace(
+                        "gpu_runner_target_cache_miss",
+                        request_id=req_id,
+                        input_id=input_id,
+                        placeholder_start=start_pos,
+                        target_end=target_end,
+                    )
                     raise RuntimeError(f"Encoder cache miss for {mm_feature.identifier}.")
 
                 if (is_embed := pos_info.is_embed) is not None:
@@ -182,6 +328,7 @@ def apply_patch() -> None:
     _patch_scheduler()
     _patch_gpu_model_runner()
     logger.info("Applied EAGLE multimodal encoder-cache backport for vLLM v0.23.0")
+    _trace("patch_applied", trace_env=_TRACE_ENV)
     _PATCH_APPLIED = True
 
 

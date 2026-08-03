@@ -40,6 +40,7 @@ Affected upstream functions
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -50,6 +51,15 @@ from vllm.model_executor.models import qwen3_vl as qwen3_vl_module
 
 logger = init_logger(__name__)
 _PATCH_APPLIED = False
+_TRACE_ENV = "VLLM_TRACE_MM_SCHEDULER"
+
+
+def _trace(event: str, **fields: object) -> None:
+    if os.getenv(_TRACE_ENV, "0").lower() not in {"1", "true", "yes", "on"}:
+        return
+
+    details = " ".join(f"{key}={value!r}" for key, value in fields.items())
+    logger.warning("MM_PATCH_TRACE component=qwen3vl_multivideo event=%s %s", event, details)
 
 
 def _replace_video_token_placeholders(
@@ -76,6 +86,33 @@ def _replace_video_token_placeholders(
         f"Found {replacement_index} video placeholders but expected {len(replacements)}"
     )
     return result
+
+
+def _get_video_placeholder_ranges(
+    prompt_ids: list[int],
+    target: list[int],
+    replacements: list[list[int]],
+) -> list[tuple[int, int]]:
+    """Report output ranges using the same replacement walk as the patch."""
+    ranges: list[tuple[int, int]] = []
+    replacement_index = 0
+    prompt_index = 0
+    output_length = 0
+    target_length = len(target)
+
+    while prompt_index < len(prompt_ids):
+        if prompt_ids[prompt_index : prompt_index + target_length] == target:
+            replacement_length = len(replacements[replacement_index])
+            ranges.append((output_length, output_length + replacement_length))
+            replacement_index += 1
+            output_length += replacement_length
+            prompt_index += target_length
+        else:
+            output_length += 1
+            prompt_index += 1
+
+    assert replacement_index == len(replacements)
+    return ranges
 
 
 def _expands_only_video_token(hf_processor: ProcessorMixin) -> bool:
@@ -193,13 +230,26 @@ def _call_hf_processor(
         if not isinstance(input_ids, list):
             input_ids = input_ids.tolist()
         (prompt_ids,) = input_ids
-        processed_outputs["input_ids"] = [
-            _replace_video_token_placeholders(
-                prompt_ids,
-                video_target,
-                video_input_ids,
-            )
-        ]
+        placeholder_ranges = _get_video_placeholder_ranges(
+            prompt_ids,
+            video_target,
+            video_input_ids,
+        )
+        processed_outputs["input_ids"] = [_replace_video_token_placeholders(prompt_ids, video_target, video_input_ids)]
+        _trace(
+            "video_placeholder_ranges",
+            transformer_expands_bare_video_token=len(video_target) == 1,
+            replacement_target=video_target,
+            prompt_length_before=len(prompt_ids),
+            prompt_length_after=len(processed_outputs["input_ids"][0]),
+            video_count=len(video_input_ids),
+            video_replacement_lengths=[len(item) for item in video_input_ids],
+            placeholder_ranges=placeholder_ranges,
+            adjacent_gaps=[
+                placeholder_ranges[index + 1][0] - placeholder_ranges[index][1]
+                for index in range(len(placeholder_ranges) - 1)
+            ],
+        )
 
     return BatchFeature(dict(processed_outputs, **video_outputs))
 
@@ -295,6 +345,7 @@ def apply_patch() -> None:
     processor_cls._get_prompt_updates = _get_prompt_updates
     processor_cls._ascend_vllm_qwen3vl_multivideo_patch = True
     logger.info("Applied Qwen3VL multi-video placeholder backport for vLLM v0.23.0")
+    _trace("patch_applied", trace_env=_TRACE_ENV)
     _PATCH_APPLIED = True
 
 
